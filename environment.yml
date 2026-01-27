@@ -1,0 +1,11 @@
+name: sppr-fuzzy
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.9
+  - numpy
+  - pandas
+  - matplotlib
+  - pip
+  - pip:
+      - -e .[scipy]

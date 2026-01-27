@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sppr-fuzzy"
+version = "0.1.0"
+description = "Strong-Path PageRank on Directed Fuzzy Graphs (reference code + experiments)."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  {name = "Antonios Kalampakas", email = "antonios.kalampakas@aum.edu.kw"}
+]
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+scipy = ["scipy>=1.10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

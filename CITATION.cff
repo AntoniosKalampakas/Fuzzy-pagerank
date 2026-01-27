@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated paper."
+title: "Strong-Path PageRank on Directed Fuzzy Graphs"
+type: software
+authors:
+  - family-names: "Kalampakas"
+    given-names: "Antonios"
+    email: "antonios.kalampakas@aum.edu.kw"
+repository-code: "https://github.com/AntoniosKalampakas/<REPO_NAME>"
+license: "MIT"
+keywords:
+  - PageRank
+  - fuzzy graphs
+  - centrality
+  - strongest path
+  - directed graphs
