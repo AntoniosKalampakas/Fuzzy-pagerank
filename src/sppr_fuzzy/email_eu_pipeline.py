@@ -8,7 +8,7 @@
 # %pip install tqdm
 
 
-# In[25]:
+# In[47]:
 
 
 # Cell 2 — imports, global config, paths
@@ -23,6 +23,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from collections import defaultdict
 from bisect import bisect_right
+from scipy.stats import kendalltau, rankdata
 
 import numpy as np
 import pandas as pd
@@ -141,6 +142,158 @@ def overlap_at_k(score: np.ndarray, target: np.ndarray, node_ids: np.ndarray, k:
 def spearman_rho(score: np.ndarray, target: np.ndarray) -> float:
     rho, _ = spearmanr(score, target)
     return float(rho)
+
+
+# In[48]:
+
+
+def stable_order_desc(values: np.ndarray, node_ids: np.ndarray) -> np.ndarray:
+    """
+    Deterministic descending order by (value desc, node_id asc).
+    Returns an array of indices (0..n-1).
+    """
+    values = np.asarray(values)
+    node_ids = np.asarray(node_ids)
+    return np.lexsort((node_ids, -values))
+
+
+def dcg_at_k(rels: np.ndarray, k: int, gain: str = "linear") -> float:
+    """
+    DCG@k for relevance array already ordered by the ranking.
+    gain:
+      - "linear": gain = rel
+      - "exp2":   gain = 2^rel - 1  (standard IR)
+    """
+    rels = np.asarray(rels, dtype=np.float64)
+    k = min(int(k), rels.size)
+    if k <= 0:
+        return 0.0
+    rels = rels[:k]
+
+    if gain == "exp2":
+        gains = np.power(2.0, rels) - 1.0
+    elif gain == "linear":
+        gains = rels
+    else:
+        raise ValueError("gain must be 'linear' or 'exp2'")
+
+    discounts = 1.0 / np.log2(np.arange(2, k + 2, dtype=np.float64))
+    return float(np.sum(gains * discounts))
+
+
+def ndcg_at_k(
+    score: np.ndarray,
+    target: np.ndarray,
+    node_ids: np.ndarray,
+    k: int,
+    gain: str = "linear",
+) -> float:
+    """
+    NDCG@k using target as graded relevance.
+    Deterministic tie-breaking via node_ids for both predicted and ideal rankings.
+    """
+    score = np.asarray(score, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    node_ids = np.asarray(node_ids)
+
+    # predicted order
+    ord_pred = stable_order_desc(score, node_ids)
+    rel_pred = target[ord_pred]
+    dcg = dcg_at_k(rel_pred, k=k, gain=gain)
+
+    # ideal order (sort by target)
+    ord_ideal = stable_order_desc(target, node_ids)
+    rel_ideal = target[ord_ideal]
+    idcg = dcg_at_k(rel_ideal, k=k, gain=gain)
+
+    if idcg <= 0.0:
+        return 0.0
+    return float(dcg / idcg)
+
+
+def kendall_tau_b(score: np.ndarray, target: np.ndarray) -> float:
+    """
+    Kendall tau-b (tie-aware). Returns tau; may be nan if all ties.
+    """
+    tau, _ = kendalltau(score, target, variant="b", nan_policy="omit")
+    return float(tau)
+
+
+def top_q_labels(target: np.ndarray, node_ids: np.ndarray, q: float) -> tuple[np.ndarray, int]:
+    """
+    Binary labels where positives are exactly the top-q fraction by target (fixed count).
+    Deterministic with node_ids tie-breaking.
+
+    Returns (y_true, k_pos), where y_true in {0,1}.
+    """
+    target = np.asarray(target, dtype=np.float64)
+    node_ids = np.asarray(node_ids)
+
+    n = target.size
+    if not (0.0 < q <= 1.0):
+        raise ValueError("q must be in (0, 1].")
+
+    k_pos = int(math.ceil(q * n))
+    k_pos = max(1, min(k_pos, n))
+
+    order = stable_order_desc(target, node_ids)
+    pos_idx = order[:k_pos]
+
+    y_true = np.zeros(n, dtype=np.int8)
+    y_true[pos_idx] = 1
+    return y_true, k_pos
+
+
+def roc_auc_from_scores(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """
+    ROC AUC using the rank statistic (handles ties via average ranks).
+    Returns nan if undefined (no positives or no negatives).
+    """
+    y_true = np.asarray(y_true).astype(np.int8, copy=False)
+    y_score = np.asarray(y_score, dtype=np.float64)
+
+    n_pos = int((y_true == 1).sum())
+    n_neg = int((y_true == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+
+    # rankdata assigns average ranks for ties, ascending ranks starting at 1
+    ranks = rankdata(y_score, method="average")
+    sum_ranks_pos = float(ranks[y_true == 1].sum())
+
+    # Mann–Whitney U -> AUC
+    auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return float(auc)
+
+
+def average_precision_from_scores(y_true: np.ndarray, y_score: np.ndarray, node_ids: np.ndarray | None = None) -> float:
+    """
+    Average Precision (AP) for binary y_true.
+    Deterministic tie-breaking: by node_ids if provided, else by index.
+    Returns nan if undefined (no positives).
+    """
+    y_true = np.asarray(y_true).astype(np.int8, copy=False)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    n = y_true.size
+
+    n_pos = int((y_true == 1).sum())
+    if n_pos == 0:
+        return float("nan")
+
+    if node_ids is None:
+        tie_ids = np.arange(n, dtype=np.int64)
+    else:
+        tie_ids = np.asarray(node_ids)
+
+    order = stable_order_desc(y_score, tie_ids)
+    y_sorted = y_true[order]
+
+    tp = np.cumsum(y_sorted == 1)
+    denom = np.arange(1, n + 1, dtype=np.float64)
+    precision = tp / denom
+
+    ap = float(precision[y_sorted == 1].sum() / n_pos)
+    return ap
 
 
 # In[30]:
@@ -785,6 +938,71 @@ def evaluate_methods(
     return pd.DataFrame(out).set_index("method")
 
 
+# In[49]:
+
+
+def evaluate_methods_more_metrics(
+    method_scores: dict[str, np.ndarray],
+    target: np.ndarray,
+    node_ids: np.ndarray,
+    ks: tuple[int, ...] = (50, 100),
+    ndcg_ks: tuple[int, ...] = (50, 100),
+    ndcg_gain: str = "linear",   # "linear" or "exp2"
+    q_pos: float = 0.10,         # top-q% by target treated as positives for AUC/AP
+    mask: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """
+    Adds:
+      - Kendall tau-b
+      - NDCG@k (graded relevance = target values)
+      - ROC AUC + Average Precision where positives are Top-q% of target
+
+    Returns a DataFrame indexed by method.
+    """
+    target = np.asarray(target, dtype=np.float64)
+    node_ids = np.asarray(node_ids)
+
+    if mask is None:
+        mask = np.ones_like(target, dtype=bool)
+    mask = mask.astype(bool, copy=False)
+
+    t = target[mask]
+    ids = node_ids[mask]
+
+    # fixed binary labels derived ONLY from target (shared across methods)
+    y_true, k_pos = top_q_labels(t, ids, q=q_pos)
+    q_pct = int(round(100 * q_pos))
+
+    out = []
+    for name, score in method_scores.items():
+        s = np.asarray(score, dtype=np.float64)[mask]
+
+        row = {
+            "method": name,
+            "rho": spearman_rho(s, t),
+            "tau": kendall_tau_b(s, t),
+        }
+
+        # overlap@k (your existing metric)
+        for k in ks:
+            row[f"overlap@{k}"] = overlap_at_k(s, t, ids, k)
+
+        # NDCG@k (ordering-sensitive)
+        for k in ndcg_ks:
+            row[f"ndcg@{k}"] = ndcg_at_k(s, t, ids, k=k, gain=ndcg_gain)
+
+        # AUC/AP for top-q% positives
+        row[f"auc_top{q_pct}p"] = roc_auc_from_scores(y_true, s)
+        row[f"ap_top{q_pct}p"] = average_precision_from_scores(y_true, s, node_ids=ids)
+
+        # optional: record how many positives that implies
+        row[f"pos_top{q_pct}p"] = int(k_pos)
+
+        out.append(row)
+
+    return pd.DataFrame(out).set_index("method")
+
+
 # In[40]:
 
 
@@ -956,17 +1174,53 @@ def results_to_latex(df_res: pd.DataFrame) -> str:
     return df_fmt.to_latex(formatters=fmts)
 
 
-# In[44]:
+# In[56]:
 
 
-# Cell 31 — Reply likelihood target (0.80/0.90 split)
+def results_to_latex_metrics(df_res: pd.DataFrame, caption: str | None = None, label: str | None = None) -> str:
+    """
+    LaTeX export with sensible per-metric formatting:
+      - rho, tau, auc_*, ap_* : 4 decimals
+      - overlap@k            : 2 decimals
+      - ndcg@k               : 3 decimals
+      - pos_top*p            : integer
+    """
+    def _fmt(x, col: str):
+        if pd.isna(x):
+            return ""
+        # integers for pos_*
+        if str(col).startswith("pos_top"):
+            return f"{int(x)}"
+        x = float(x)
+        if col in ("rho", "tau") or str(col).startswith(("auc_", "ap_")):
+            return f"{x:.4f}"
+        if str(col).startswith("overlap@"):
+            return f"{x:.2f}"
+        if str(col).startswith("ndcg@"):
+            return f"{x:.3f}"
+        return f"{x:.4f}"
+
+    fmts = {col: (lambda x, col=str(col): _fmt(x, col)) for col in df_res.columns}
+
+    return df_res.to_latex(
+        formatters=fmts,
+        caption=caption,
+        label=label,
+        escape=True,   # keep underscores safe (e.g., thWPR_sigma=0.60)
+    )
+
+
+# In[57]:
+
+
+# Cell 31 — Reply likelihood target (0.80/0.90 split) + compact table
 
 F = run_80_90["F"]
 df_eval = run_80_90["df_eval"]
 
 tgt_reply_7d_80_90 = target_future_reply_likelihood(
-    df_all=df,              # full timeline to find replies after incoming
-    df_eval=df_eval,        # incoming events in the evaluation window
+    df_all=df,
+    df_eval=df_eval,
     F=F,
     reply_horizon_days=7.0,
     use_replies_after_eval_end=True
@@ -976,45 +1230,64 @@ methods = {}
 methods.update(run_80_90["baselines"])
 methods.update(run_80_90["sppr_table"])
 
-res_reply_80_90 = evaluate_methods(methods, tgt_reply_7d_80_90, node_ids=F.idx_to_id, ks=(50, 100))
-ordered_results(res_reply_80_90, run_80_90)
+res_reply_80_90_more = evaluate_methods_more_metrics(
+    methods,
+    tgt_reply_7d_80_90,
+    node_ids=F.idx_to_id,
+    ks=(100,),          # only overlap@100
+    ndcg_ks=(100,),     # only ndcg@100
+    ndcg_gain="linear",
+    q_pos=0.10          # AUC/AP computed; we'll only display AUC
+)
+
+keep_cols = ["rho", "tau", "overlap@100", "ndcg@100", "auc_top10p"]
+tab_reply_80_90_compact = ordered_results(res_reply_80_90_more, run_80_90)[keep_cols]
+display(tab_reply_80_90_compact)
 
 
-# In[45]:
+# In[58]:
 
 
-# Cell 32 — LaTeX for reply likelihood (0.80/0.90 split)
+# Cell 32 — LaTeX for reply likelihood (0.80/0.90 split), compact
 
-tab_reply_80_90 = ordered_results(res_reply_80_90, run_80_90)
-print(results_to_latex(tab_reply_80_90))
-
-
-# In[46]:
+print(results_to_latex_metrics(tab_reply_80_90_compact))
 
 
-# Cell — Reply likelihood target + table (0.70/0.80 split)
+# In[59]:
+
+
+# Cell — Reply likelihood target + compact table (0.70/0.80 split)
 
 F = run_70_80["F"]
 df_eval = run_70_80["df_eval"]
 
 tgt_reply_7d_70_80 = target_future_reply_likelihood(
-    df_all=df,              # full timeline to find replies after incoming
-    df_eval=df_eval,        # incoming events in the evaluation window
+    df_all=df,
+    df_eval=df_eval,
     F=F,
     reply_horizon_days=7.0,
     use_replies_after_eval_end=True
 )
 
 methods = {}
-methods.update(run_70_80["baselines"])     # includes PR, WPR, thWPR_sigma=..., InStrength
-methods.update(run_70_80["sppr_table"])    # SPPR rows for SIGMA_TABLE
+methods.update(run_70_80["baselines"])
+methods.update(run_70_80["sppr_table"])
 
-res_reply_70_80 = evaluate_methods(methods, tgt_reply_7d_70_80, node_ids=F.idx_to_id, ks=(50, 100))
+res_reply_70_80_more = evaluate_methods_more_metrics(
+    methods,
+    tgt_reply_7d_70_80,
+    node_ids=F.idx_to_id,
+    ks=(100,),          # only overlap@100
+    ndcg_ks=(100,),     # only ndcg@100
+    ndcg_gain="linear",
+    q_pos=0.10
+)
 
-tab_reply_70_80 = ordered_results(res_reply_70_80, run_70_80)
-display(tab_reply_70_80)
+keep_cols = ["rho", "tau", "overlap@100", "ndcg@100", "auc_top10p"]
+tab_reply_70_80_compact = ordered_results(res_reply_70_80_more, run_70_80)[keep_cols]
+display(tab_reply_70_80_compact)
 
-print(results_to_latex(tab_reply_70_80))
+print(results_to_latex_metrics(tab_reply_70_80_compact))
 
 
 # In[ ]:
