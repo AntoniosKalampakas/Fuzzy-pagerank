@@ -1,453 +1,1024 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+# # Cell 1 
+# %pip install tqdm
+
+
+# In[2]:
+
+
+# Cell 2 — imports, global config, paths
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional, Iterable
-from pathlib import Path
 import os
-import urllib.request
+import math
+import gzip
+import json
+import time
+from pathlib import Path
+from dataclasses import dataclass
+from collections import defaultdict
+from bisect import bisect_right
+
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
 
-from .pagerank import pagerank_power
-from .widest_path import compute_strong_edges
-from .scc import scc_kosaraju
+from scipy.stats import spearmanr
+from scipy import sparse
 
-# Optional: use SciPy correlations when available
-try:
-    from scipy.stats import spearmanr  # type: ignore
-    SCIPY_OK = True
-except Exception:
-    SCIPY_OK = False
+# Reproducibility
+np.random.seed(0)
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True, parents=True)
+
+CACHE_DIR = DATA_DIR / "cache"
+CACHE_DIR.mkdir(exist_ok=True, parents=True)
+
+FIG_DIR = Path("figures")
+FIG_DIR.mkdir(exist_ok=True, parents=True)
+
+# SNAP file
+SNAP_URL = "https://snap.stanford.edu/data/email-Eu-core-temporal.txt.gz"
+RAW_GZ = DATA_DIR / "email-Eu-core-temporal.txt.gz"
+RAW_TXT = DATA_DIR / "email-Eu-core-temporal.txt"
+
+# Paper constants
+ALPHA = 0.85
+SIGMA_THWPR = 0.60  # your \sigmaThWPR macro
+
+# Strong-edge tolerance
+STRONG_EPS = 1e-12
+
+# Default sigma list used in the paper tables (as in your manuscript)
+SIGMA_TABLE = [0.2626, 0.4415, 0.4989, 0.5550, 0.5825, 0.7215, 0.9900]
 
 
-SNAP_CORE_URL = "https://snap.stanford.edu/data/email-Eu-core-temporal.txt.gz"
-SNAP_DEPT_URLS = {
-    "dept1": "https://snap.stanford.edu/data/email-Eu-core-temporal-Dept1.txt.gz",
-    "dept2": "https://snap.stanford.edu/data/email-Eu-core-temporal-Dept2.txt.gz",
-    "dept3": "https://snap.stanford.edu/data/email-Eu-core-temporal-Dept3.txt.gz",
-    "dept4": "https://snap.stanford.edu/data/email-Eu-core-temporal-Dept4.txt.gz",
-}
+# In[3]:
 
+
+# Cell 3 — download SNAP data (runs only if missing)
+import urllib.request
+
+if not RAW_GZ.exists():
+    print(f"Downloading: {SNAP_URL}")
+    urllib.request.urlretrieve(SNAP_URL, RAW_GZ)
+    print(f"Saved to: {RAW_GZ}")
+else:
+    print(f"Found: {RAW_GZ}")
+
+
+# In[4]:
+
+
+# Cell 4 — unzip to a .txt for faster reloading (runs only if missing)
+if not RAW_TXT.exists():
+    print(f"Decompressing {RAW_GZ} -> {RAW_TXT}")
+    with gzip.open(RAW_GZ, "rt") as f_in, open(RAW_TXT, "w") as f_out:
+        for line in f_in:
+            if line.strip() and not line.startswith("#"):
+                f_out.write(line)
+    print("Done.")
+else:
+    print(f"Found: {RAW_TXT}")
+
+
+# In[5]:
+
+
+# Cell 5 — load events into a DataFrame
+# Format: src dst ts (ts in seconds; starts at 0 in this dataset)
+df = pd.read_csv(RAW_TXT, sep=r"\s+", names=["src", "dst", "t"], dtype=np.int64)
+df = df.sort_values("t").reset_index(drop=True)
+df.head(), df.shape
+
+
+# In[6]:
+
+
+# Cell 6 — utilities: splitting, stable ranking, overlap, etc.
+
+def time_quantiles(df_events: pd.DataFrame, q_train: float, q_eval: float) -> tuple[int, int]:
+    """
+    Returns (tau, tau') where tau is q_train-quantile and tau' is q_eval-quantile of timestamps.
+    Uses numpy quantile (linear interpolation).
+    """
+    ts = df_events["t"].to_numpy()
+    tau = int(np.quantile(ts, q_train))
+    tau2 = int(np.quantile(ts, q_eval))
+    return tau, tau2
+
+def split_events(df_events: pd.DataFrame, q_train: float, q_eval: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Train: t <= tau
+    Eval : tau < t <= tau'
+    """
+    tau, tau2 = time_quantiles(df_events, q_train=q_train, q_eval=q_eval)
+    train = df_events[df_events["t"] <= tau].copy()
+    eval_ = df_events[(df_events["t"] > tau) & (df_events["t"] <= tau2)].copy()
+    return train, eval_
+
+def stable_topk_set(values: np.ndarray, node_ids: np.ndarray, k: int) -> set[int]:
+    """
+    Deterministic top-k by sorting on (-value, node_id).
+    """
+    k = min(k, len(node_ids))
+    order = np.lexsort((node_ids, -values))
+    top = node_ids[order[:k]]
+    return set(map(int, top))
+
+def overlap_at_k(score: np.ndarray, target: np.ndarray, node_ids: np.ndarray, k: int) -> float:
+    pred = stable_topk_set(score, node_ids, k)
+    truth = stable_topk_set(target, node_ids, k)
+    return len(pred & truth) / float(k)
+
+def spearman_rho(score: np.ndarray, target: np.ndarray) -> float:
+    rho, _ = spearmanr(score, target)
+    return float(rho)
+
+
+# In[7]:
+
+
+# Cell 7 — build dyadic counts and fuzzy memberships (lambda), then high-confidence cutoff + mu
 
 @dataclass
-class IndexedDiGraph:
-    nodes: np.ndarray
-    node_to_idx: Dict[int, int]
-    out_adj: List[List[Tuple[int, float]]]
-    out_wsum: np.ndarray
-    out_deg: np.ndarray
+class FuzzyDigraph:
+    node_ids: np.ndarray          # original node ids
+    id_to_idx: dict[int,int]      # mapping node id -> [0..n-1]
+    idx_to_id: np.ndarray         # inverse mapping
+    n: int
+
+    # high-confidence directed edges
+    src: np.ndarray               # int32 indices
+    dst: np.ndarray               # int32 indices
+    w: np.ndarray                 # float64 memberships in [0,1]
+    m: int
+
+    # vertex memberships mu in [0,1]
+    mu: np.ndarray                # float64 length n
+
+    # in-strength counts from training window (baseline)
+    instrength: np.ndarray        # float64 length n
+
+    # helpful metadata
+    lambda_min: float
+    cmax: int
+    q_train: float
+    q_eval: float
+    tau: int
+    tau2: int
 
 
-def _download_if_missing(url: str, local_path: Path) -> None:
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    if local_path.exists():
-        return
-    print(f"Downloading: {url}")
-    urllib.request.urlretrieve(url, local_path.as_posix())
-    print(f"Saved: {local_path}")
-
-
-def load_snap_email_events(gz_path: Path) -> pd.DataFrame:
-    """Load SNAP email temporal events (SRC DST TIME)."""
-    events = pd.read_csv(
-        gz_path.as_posix(),
-        sep=r"\s+",
-        comment="#",
-        header=None,
-        names=["src", "dst", "time"],
-        compression="gzip",
-        dtype={"src": np.int32, "dst": np.int32, "time": np.int64},
-    )
-    return events
-
-
-def pick_time_cutoffs(events: pd.DataFrame, train_frac: float, eval_frac: float) -> Tuple[int, int]:
-    t = events["time"].to_numpy()
-    tau = int(np.quantile(t, float(train_frac)))
-    tau_prime = int(np.quantile(t, float(eval_frac)))
-    if tau_prime <= tau:
-        tau_prime = tau + 1
-    return tau, tau_prime
-
-
-def scale_to_unit_interval(raw: np.ndarray, method: str = "log") -> np.ndarray:
-    raw = np.asarray(raw, dtype=np.float64)
-    if raw.size == 0:
-        return raw
-    mx = float(raw.max())
-    if mx <= 0:
-        return np.zeros_like(raw)
-
-    method = str(method).lower()
-    if method == "log":
-        return np.log1p(raw) / np.log1p(mx)
-    if method == "minmax":
-        return raw / mx
-    if method == "cauchy":
-        pos = raw[raw > 0]
-        tau = float(np.median(pos)) if pos.size else 1.0
-        return raw / (raw + tau)
-    raise ValueError(f"Unknown scale method: {method}")
-
-
-def aggregate_email_edges(
-    events: pd.DataFrame,
-    *,
-    end_time: Optional[int] = None,
-    method: str = "count",
-    half_life_days: float = 60.0,
-    scale: str = "log",
-) -> pd.DataFrame:
-    """Aggregate temporal events to a weighted directed edge list.
-
-    Output columns: src, dst, w (scaled membership in [0,1]), raw (unscaled intensity).
+def build_fuzzy_graph_from_train(
+    df_train: pd.DataFrame,
+    q_train: float,
+    q_eval: float,
+    tau: int,
+    tau2: int,
+    highconf_quantile: float = 0.70,
+) -> tuple[FuzzyDigraph, pd.DataFrame]:
     """
-    method = str(method).lower()
-    if method == "count":
-        grp = events.groupby(["src", "dst"]).size().reset_index(name="raw")
-        raw = grp["raw"].to_numpy(dtype=np.float64)
+    From training events, build dyadic counts c_uv, compute lambda via log scaling,
+    then threshold by the 70th percentile of lambda values (high-confidence subgraph).
+    Also compute mu(v) = max incident lambda in the high-confidence graph.
+    Returns (FuzzyDigraph, edges_df_full_train) where edges_df_full_train includes lambda for all dyads.
+    """
+    # Dyadic counts from training window
+    grp = df_train.groupby(["src", "dst"], sort=False).size().reset_index(name="c")
+    cmax = int(grp["c"].max())
+    grp["lambda"] = np.log1p(grp["c"].to_numpy(dtype=np.float64)) / np.log1p(float(cmax))
 
-    elif method == "decay":
-        if end_time is None:
-            raise ValueError("end_time required for method='decay'")
-        half_life_sec = float(half_life_days) * 86400.0
-        dt = (float(end_time) - events["time"].to_numpy(dtype=np.float64))
-        contrib = np.exp(-dt / half_life_sec)
-        tmp = events[["src", "dst"]].copy()
-        tmp["raw"] = contrib
-        grp = tmp.groupby(["src", "dst"])["raw"].sum().reset_index(name="raw")
-        raw = grp["raw"].to_numpy(dtype=np.float64)
-
-    else:
-        raise ValueError(f"Unknown aggregation method: {method}")
-
-    w = scale_to_unit_interval(raw, method=scale)
-    out = grp.copy()
-    out["w"] = w
-    return out[["src", "dst", "w", "raw"]]
-
-
-def build_indexed_digraph(edges: pd.DataFrame, nodes: np.ndarray) -> IndexedDiGraph:
-    node_to_idx = {int(v): i for i, v in enumerate(nodes)}
-    n = int(len(nodes))
-    out_adj: List[List[Tuple[int, float]]] = [[] for _ in range(n)]
-    out_wsum = np.zeros(n, dtype=np.float64)
-    out_deg = np.zeros(n, dtype=np.float64)
-
-    for row in edges.itertuples(index=False):
-        u0, v0, w = int(row.src), int(row.dst), float(row.w)
-        if u0 not in node_to_idx or v0 not in node_to_idx:
-            continue
-        u = node_to_idx[u0]
-        v = node_to_idx[v0]
-        out_adj[u].append((v, w))
-        out_wsum[u] += w
-        out_deg[u] += 1.0
-
-    return IndexedDiGraph(nodes=nodes, node_to_idx=node_to_idx, out_adj=out_adj, out_wsum=out_wsum, out_deg=out_deg)
-
-
-def make_support_graph(G: IndexedDiGraph) -> Tuple[List[List[Tuple[int, float]]], np.ndarray]:
-    n = len(G.out_adj)
-    out_adj = [[] for _ in range(n)]
-    out_deg = np.zeros(n, dtype=np.float64)
-    for i in range(n):
-        nbrs = G.out_adj[i]
-        if nbrs:
-            out_adj[i] = [(j, 1.0) for (j, _) in nbrs]
-            out_deg[i] = float(len(nbrs))
-    return out_adj, out_deg
-
-
-def compute_mu_from_edges(edges: pd.DataFrame, nodes: np.ndarray) -> np.ndarray:
-    """Vertex membership mu(v) := max{ max_out(v), max_in(v) } from the given edge list."""
-    node_to_idx = {int(v): i for i, v in enumerate(nodes)}
+    # Node set: all nodes that appear in training (as src or dst)
+    nodes = np.unique(np.concatenate([df_train["src"].unique(), df_train["dst"].unique()]))
+    nodes = np.sort(nodes)
     n = len(nodes)
-    max_out = np.zeros(n, dtype=np.float64)
-    max_in = np.zeros(n, dtype=np.float64)
+    id_to_idx = {int(v): i for i, v in enumerate(nodes)}
+    idx_to_id = nodes.copy()
 
-    for row in edges.itertuples(index=False):
-        u0, v0, w = int(row.src), int(row.dst), float(row.w)
-        if u0 not in node_to_idx or v0 not in node_to_idx:
+    # Training-window in-strength baseline (counts, not lambdas)
+    instr = np.zeros(n, dtype=np.float64)
+    # aggregate incoming counts
+    for _, row in grp.iterrows():
+        v = int(row["dst"])
+        instr[id_to_idx[v]] += float(row["c"])
+
+    # High-confidence cutoff on lambda values over observed dyads
+    lambdas = grp["lambda"].to_numpy(dtype=np.float64)
+    lambda_min = float(np.quantile(lambdas, highconf_quantile))
+
+    high = grp[grp["lambda"] >= lambda_min].copy()
+
+    # Build high-confidence edge arrays
+    src = high["src"].map(id_to_idx).to_numpy(dtype=np.int32)
+    dst = high["dst"].map(id_to_idx).to_numpy(dtype=np.int32)
+    w = high["lambda"].to_numpy(dtype=np.float64)
+
+    # Vertex memberships mu(v) from high-confidence incident edges
+    mu = np.zeros(n, dtype=np.float64)
+    # outgoing
+    for u_i, wt in zip(src, w):
+        if wt > mu[u_i]:
+            mu[u_i] = wt
+    # incoming
+    for v_i, wt in zip(dst, w):
+        if wt > mu[v_i]:
+            mu[v_i] = wt
+
+    F = FuzzyDigraph(
+        node_ids=nodes,
+        id_to_idx=id_to_idx,
+        idx_to_id=idx_to_id,
+        n=n,
+        src=src,
+        dst=dst,
+        w=w,
+        m=len(w),
+        mu=mu,
+        instrength=instr,
+        lambda_min=lambda_min,
+        cmax=cmax,
+        q_train=q_train,
+        q_eval=q_eval,
+        tau=tau,
+        tau2=tau2,
+    )
+    return F, grp
+
+
+# In[8]:
+
+
+# Cell 8 — build adjacency lists (needed for widest-path and SCC thresholding)
+
+@dataclass
+class AdjLists:
+    out_nbrs: list[np.ndarray]     # out_nbrs[u] = array of neighbors
+    out_wts: list[np.ndarray]      # out_wts[u]  = array of weights aligned with out_nbrs[u]
+    out_edge_idx: list[np.ndarray] # indices into edge arrays (src,dst,w) for each u
+
+    in_nbrs: list[np.ndarray]
+    in_wts: list[np.ndarray]
+
+def make_adjlists(F: FuzzyDigraph) -> AdjLists:
+    n = F.n
+    # group edges by src
+    buckets = [[] for _ in range(n)]
+    for ei, u in enumerate(F.src):
+        buckets[int(u)].append(ei)
+
+    out_nbrs, out_wts, out_edge_idx = [], [], []
+    for u in range(n):
+        idxs = np.array(buckets[u], dtype=np.int32)
+        out_edge_idx.append(idxs)
+        if len(idxs) == 0:
+            out_nbrs.append(np.array([], dtype=np.int32))
+            out_wts.append(np.array([], dtype=np.float64))
+        else:
+            out_nbrs.append(F.dst[idxs])
+            out_wts.append(F.w[idxs])
+
+    # build reverse adjacency
+    in_buckets = [[] for _ in range(n)]
+    for ei, v in enumerate(F.dst):
+        in_buckets[int(v)].append(ei)
+
+    in_nbrs, in_wts = [], []
+    for v in range(n):
+        idxs = np.array(in_buckets[v], dtype=np.int32)
+        if len(idxs) == 0:
+            in_nbrs.append(np.array([], dtype=np.int32))
+            in_wts.append(np.array([], dtype=np.float64))
+        else:
+            in_nbrs.append(F.src[idxs])
+            in_wts.append(F.w[idxs])
+
+    return AdjLists(out_nbrs=out_nbrs, out_wts=out_wts, out_edge_idx=out_edge_idx,
+                    in_nbrs=in_nbrs, in_wts=in_wts)
+
+
+# In[9]:
+
+
+# Cell 9 — PageRank on a row-stochastic kernel represented as a sparse CSR (with dangling fix)
+
+def pagerank_rowstochastic_csr(
+    P: sparse.csr_matrix,
+    dangling_rows: np.ndarray,
+    alpha: float = 0.85,
+    tol: float = 1e-12,
+    max_iter: int = 500,
+    u: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Computes p = alpha * P^T p + (1-alpha) u, with dangling rows replaced by u.
+
+    P: CSR row-stochastic on non-dangling rows; dangling rows are all zeros.
+    dangling_rows: boolean array length n indicating dangling rows.
+    u: teleportation distribution (column). If None, uniform.
+    """
+    n = P.shape[0]
+    if u is None:
+        u = np.full(n, 1.0 / n, dtype=np.float64)
+    else:
+        u = u.astype(np.float64, copy=False)
+        u = u / u.sum()
+
+    PT = P.transpose().tocsr()
+    p = np.full(n, 1.0 / n, dtype=np.float64)
+
+    dangling_rows = dangling_rows.astype(bool, copy=False)
+
+    for _ in range(max_iter):
+        dangling_mass = p[dangling_rows].sum()
+        p_next = alpha * (PT @ p + dangling_mass * u) + (1.0 - alpha) * u
+        # normalize defensively
+        p_next = np.asarray(p_next).reshape(-1)
+        p_next /= p_next.sum()
+
+        if np.abs(p_next - p).sum() <= tol:
+            p = p_next
+            break
+        p = p_next
+
+    return p
+
+
+# In[10]:
+
+
+# Cell 10 — build CSR row-stochastic matrix from edges (node-level baselines)
+
+def build_rowstochastic_csr_from_edges(
+    n: int,
+    src: np.ndarray,
+    dst: np.ndarray,
+    weight: np.ndarray,
+) -> tuple[sparse.csr_matrix, np.ndarray]:
+    """
+    Builds a CSR matrix P where P[u,v] = weight(u,v)/sum_out(u), with zero rows for dangling.
+    Returns (P, dangling_rows).
+    """
+    src = src.astype(np.int32, copy=False)
+    dst = dst.astype(np.int32, copy=False)
+    weight = weight.astype(np.float64, copy=False)
+
+    out_sum = np.zeros(n, dtype=np.float64)
+    np.add.at(out_sum, src, weight)
+
+    dangling = (out_sum == 0)
+
+    # Normalize weights where out_sum>0
+    norm_w = weight / out_sum[src]
+
+    P = sparse.csr_matrix((norm_w, (src, dst)), shape=(n, n), dtype=np.float64)
+    return P, dangling
+
+
+# In[11]:
+
+
+# Cell 11 — widest-path (max–min) routine + strong-edge extraction (streaming per source)
+import heapq
+
+def widest_path_from_source(adj: AdjLists, s: int) -> np.ndarray:
+    """
+    Computes Con_F(s, v) for all v under max–min (widest path) semantics on the *high-confidence* support.
+    Returns best[v] in [0,1], with best[s]=1.
+    """
+    n = len(adj.out_nbrs)
+    best = np.zeros(n, dtype=np.float64)
+    best[s] = 1.0
+
+    heap = [(-1.0, s)]  # max-heap via negative
+    while heap:
+        neg_b, u = heapq.heappop(heap)
+        b = -neg_b
+        if b < best[u] - 1e-15:
             continue
-        u = node_to_idx[u0]
-        v = node_to_idx[v0]
-        if w > max_out[u]:
-            max_out[u] = w
-        if w > max_in[v]:
-            max_in[v] = w
+        nbrs = adj.out_nbrs[u]
+        wts = adj.out_wts[u]
+        for v, w in zip(nbrs, wts):
+            cand = b if b < w else w  # min(b, w)
+            if cand > best[int(v)] + 1e-15:
+                best[int(v)] = cand
+                heapq.heappush(heap, (-cand, int(v)))
+    return best
 
-    mu = np.maximum(max_in, max_out)
-    return mu
+def compute_strong_edges(
+    F: FuzzyDigraph,
+    adj: AdjLists,
+    eps: float = 1e-12,
+    cache_key: str | None = None,
+) -> np.ndarray:
+    """
+    Strong edge: support edge (u,v) with w(u,v) == Con_F(u,v) (within eps).
+    Returns an array of edge indices into F.src/F.dst/F.w that are strong.
+    Caches to disk if cache_key is provided.
+    """
+    if cache_key is not None:
+        cache_path = CACHE_DIR / f"strong_edges_{cache_key}.npy"
+        if cache_path.exists():
+            return np.load(cache_path)
+
+    strong_idx = []
+
+    for u in tqdm(range(F.n), desc="Strong edges: widest-path per source"):
+        best = widest_path_from_source(adj, u)
+        eidxs = adj.out_edge_idx[u]
+        if len(eidxs) == 0:
+            continue
+        dsts = F.dst[eidxs]
+        ws = F.w[eidxs]
+        # compare each outgoing edge weight to Con(u, v)
+        con_vals = best[dsts]
+        mask = np.abs(ws - con_vals) <= eps
+        if np.any(mask):
+            strong_idx.extend(eidxs[mask].tolist())
+
+    strong_idx = np.array(strong_idx, dtype=np.int32)
+
+    if cache_key is not None:
+        np.save(cache_path, strong_idx)
+
+    return strong_idx
 
 
-def threshold_adj(out_adj: List[List[Tuple[int, float]]], sigma: float) -> List[List[Tuple[int, float]]]:
-    s = float(sigma)
-    return [[(v, w) for (v, w) in nbrs if float(w) >= s] for nbrs in out_adj]
+# In[12]:
 
 
-def sppr_vertex_scores(
-    G: IndexedDiGraph,
-    *,
-    mu: np.ndarray,
-    strong_edges: np.ndarray,
+# Cell 12 — SCC partition of the sigma-cut digraph (custom Kosaraju; uses threshold sigma on weights)
+
+def scc_kosaraju_sigma(adj: AdjLists, sigma: float) -> tuple[np.ndarray, int]:
+    """
+    Computes SCCs of the sigma-cut digraph: edges with weight >= sigma.
+    Returns (comp_id, num_comps), where comp_id[v] in [0..m-1].
+    """
+    n = len(adj.out_nbrs)
+    visited = np.zeros(n, dtype=bool)
+    order = []
+
+    # iterative DFS for finishing order
+    for start in range(n):
+        if visited[start]:
+            continue
+        stack = [(start, 0)]
+        visited[start] = True
+        while stack:
+            u, i = stack[-1]
+            nbrs = adj.out_nbrs[u]
+            wts = adj.out_wts[u]
+            # advance i until we find an admissible edge or exhaust
+            while i < len(nbrs) and wts[i] < sigma:
+                i += 1
+            if i >= len(nbrs):
+                stack.pop()
+                order.append(u)
+                continue
+            v = int(nbrs[i])
+            stack[-1] = (u, i + 1)
+            if not visited[v]:
+                visited[v] = True
+                stack.append((v, 0))
+
+    # second pass on reversed graph
+    comp = np.full(n, -1, dtype=np.int32)
+    comp_count = 0
+    for start in reversed(order):
+        if comp[start] != -1:
+            continue
+        # BFS/DFS on reverse edges with same sigma threshold
+        stack = [start]
+        comp[start] = comp_count
+        while stack:
+            u = stack.pop()
+            nbrs = adj.in_nbrs[u]
+            wts = adj.in_wts[u]
+            for v, w in zip(nbrs, wts):
+                if w < sigma:
+                    continue
+                v = int(v)
+                if comp[v] == -1:
+                    comp[v] = comp_count
+                    stack.append(v)
+        comp_count += 1
+
+    return comp, comp_count
+
+
+# In[13]:
+
+
+# Cell 13 — SPPR kernel build at a given sigma + lift to vertices
+
+def sppr_scores_for_sigma(
+    F: FuzzyDigraph,
+    adj: AdjLists,
+    strong_edge_idx: np.ndarray,
     sigma: float,
     alpha: float = 0.85,
-    tol: float = 1e-12,
-    max_iter: int = 200,
-) -> Tuple[np.ndarray, Dict]:
-    """Compute SPPR vertex scores at threshold sigma on a weighted digraph.
-
-    Returns
-    -------
-    scores: np.ndarray
-        Vertex-level scores fPR(v)=mu(v)*p_class[class(v)].
-    meta: dict
-        Includes sigma, m_classes, class sizes, and class PageRank vector.
+) -> tuple[np.ndarray, int]:
     """
-    # 1) SCC classes for the sigma-cut graph (computed from original weights)
-    out_thr = threshold_adj(G.out_adj, sigma)
-    comp_id, comps = scc_kosaraju(out_thr)
-    m = len(comps)
+    Returns (vertex_scores, m) where m = number of SCC-classes at threshold sigma.
 
-    # 2) bar_mu per class
+    Class construction: SCCs of sigma-cut digraph.
+    Backbone coefficients: max over sigma-admissible strong edges between classes.
+    Diagonal set to 0.
+    """
+    comp, m = scc_kosaraju_sigma(adj, sigma)
+
+    # class memberships bar_mu = max mu(v) within class
     bar_mu = np.zeros(m, dtype=np.float64)
-    for i, vs in enumerate(comps):
-        bar_mu[i] = float(mu[vs].max()) if vs else 0.0
+    for v in range(F.n):
+        c = int(comp[v])
+        if F.mu[v] > bar_mu[c]:
+            bar_mu[c] = F.mu[v]
 
-    # 3) Lambda^{ssp}_{ij}: max strong-edge weight from class i to class j
-    # store as per-row dict for sparsity
-    lambda_max: List[Dict[int, float]] = [dict() for _ in range(m)]
-    for u, v, w in strong_edges:
-        u_i = int(u); v_i = int(v); w_f = float(w)
-        i = int(comp_id[u_i]); j = int(comp_id[v_i])
-        if i == j:
+    # aggregate Lambda^{ssp}_{ij} from strong edges with w>=sigma
+    Lambda = {}  # (ci,cj) -> max weight
+    for ei in strong_edge_idx:
+        w = float(F.w[ei])
+        if w < sigma:
             continue
-        prev = float(lambda_max[i].get(j, 0.0))
-        if w_f > prev:
-            lambda_max[i][j] = w_f
+        u = int(F.src[ei]); v = int(F.dst[ei])
+        ci = int(comp[u]); cj = int(comp[v])
+        if ci == cj:
+            continue
+        key = (ci, cj)
+        prev = Lambda.get(key, 0.0)
+        if w > prev:
+            Lambda[key] = w
 
-    # 4) Build class adjacency with w_ij = min(bar_mu[i], bar_mu[j], lambda_max[i][j])
-    class_adj: List[List[Tuple[int, float]]] = [[] for _ in range(m)]
-    class_rowsum = np.zeros(m, dtype=np.float64)
-    for i in range(m):
-        for j, lam in lambda_max[i].items():
-            wij = min(float(bar_mu[i]), float(bar_mu[j]), float(lam))
-            if wij > 0:
-                class_adj[i].append((int(j), float(wij)))
-                class_rowsum[i] += float(wij)
+    if len(Lambda) == 0:
+        # no inter-class edges; PageRank becomes uniform on classes and lift via mu
+        p_class = np.full(m, 1.0/m, dtype=np.float64)
+        scores = F.mu * p_class[comp]
+        return scores, m
 
-    # 5) PageRank on classes
-    p_class = pagerank_power(class_adj, class_rowsum, alpha=alpha, tol=tol, max_iter=max_iter)
+    # build sparse row-stochastic P on classes
+    rows = np.fromiter((k[0] for k in Lambda.keys()), dtype=np.int32, count=len(Lambda))
+    cols = np.fromiter((k[1] for k in Lambda.keys()), dtype=np.int32, count=len(Lambda))
+    vals_raw = np.fromiter((v for v in Lambda.values()), dtype=np.float64, count=len(Lambda))
 
-    # 6) Lift to vertices: fPR(v) = mu(v) * p_class[class(v)]
-    scores = np.asarray(mu, dtype=np.float64) * p_class[comp_id.astype(np.int32)]
+    # w_ij = min(bar_mu_i, bar_mu_j, Lambda_ij) — kept for consistency with manuscript
+    vals = np.minimum(vals_raw, np.minimum(bar_mu[rows], bar_mu[cols]))
 
-    meta = {
-        "sigma": float(sigma),
-        "m_classes": int(m),
-        "class_sizes": np.array([len(c) for c in comps], dtype=np.int32),
-        "bar_mu": bar_mu,
-        "p_class": p_class,
-        "comp_id": comp_id,
-    }
-    return scores, meta
+    out_sum = np.zeros(m, dtype=np.float64)
+    np.add.at(out_sum, rows, vals)
+    dangling = (out_sum == 0)
 
+    vals_norm = vals / out_sum[rows]
+    P = sparse.csr_matrix((vals_norm, (rows, cols)), shape=(m, m), dtype=np.float64)
 
-def future_incoming_volume(test_events: pd.DataFrame, nodes: np.ndarray) -> np.ndarray:
-    node_to_idx = {int(v): i for i, v in enumerate(nodes)}
-    y = np.zeros(len(nodes), dtype=np.float64)
-    counts = test_events.groupby("dst").size()
-    for dst, c in counts.items():
-        dst = int(dst)
-        if dst in node_to_idx:
-            y[node_to_idx[dst]] = float(c)
-    return y
+    u = np.full(m, 1.0/m, dtype=np.float64)
+    p_class = pagerank_rowstochastic_csr(P, dangling_rows=dangling, alpha=alpha, u=u)
+
+    # lift to vertices: fPR(v)=mu(v)*p_[v]
+    scores = F.mu * p_class[comp]
+    return scores, m
 
 
-def _rankdata_desc(x: np.ndarray) -> np.ndarray:
-    # rank 1 = largest; ties get average rank
-    x = np.asarray(x)
-    order = np.argsort(-x, kind="mergesort")
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(1, len(x) + 1, dtype=np.float64)
-
-    sorted_x = x[order]
-    i = 0
-    while i < len(x):
-        j = i
-        while j + 1 < len(x) and sorted_x[j + 1] == sorted_x[i]:
-            j += 1
-        if j > i:
-            avg = (i + 1 + j + 1) / 2.0
-            ranks[order[i : j + 1]] = avg
-        i = j + 1
-    return ranks
+# In[14]:
 
 
-def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
-    if SCIPY_OK:
-        return float(spearmanr(a, b).correlation)
-    ra = _rankdata_desc(a)
-    rb = _rankdata_desc(b)
-    ra = ra - ra.mean()
-    rb = rb - rb.mean()
-    denom = float(np.linalg.norm(ra) * np.linalg.norm(rb))
-    if denom == 0:
-        return float("nan")
-    return float((ra @ rb) / denom)
+# Cell 14 — Baseline scores: PR, WPR, thWPR, plus InStrength
 
-
-def overlap_at_k(a: np.ndarray, b: np.ndarray, k: int) -> float:
-    k = int(min(int(k), len(a)))
-    ta = set(np.argsort(-a)[:k].tolist())
-    tb = set(np.argsort(-b)[:k].tolist())
-    return float(len(ta & tb)) / float(k)
-
-
-def choose_sigma_grid(hc_weights: np.ndarray, mode: str, points: int) -> np.ndarray:
-    w = np.asarray(hc_weights, dtype=np.float64)
-    w = w[w > 0]
-    if w.size == 0:
-        raise ValueError("No positive HC weights.")
-    mode = str(mode).lower()
-    points = int(points)
-
-    if mode == "quantiles":
-        qs = np.linspace(0.10, 0.95, points)
-        sigmas = np.quantile(w, qs)
-    elif mode == "linspace":
-        sigmas = np.linspace(float(w.min()), float(w.max()), points)
-    else:
-        raise ValueError("sigma grid mode must be 'quantiles' or 'linspace'.")
-
-    sigmas = np.unique(np.clip(sigmas, 1e-6, 1.0))
-    return np.sort(sigmas)
-
-
-def run_email_eu_experiment(
-    *,
-    dataset: str = "core",
-    data_dir: str = "data",
-    outputs_dir: str = "outputs",
-    train_frac: float = 0.80,
-    eval_frac: float = 0.90,
+def baseline_scores(
+    F: FuzzyDigraph,
     alpha: float = 0.85,
-    max_iter: int = 200,
-    tol: float = 1e-12,
-    agg_method: str = "count",
-    half_life_days: float = 60.0,
-    scale_method: str = "log",
-    lambda_min: float = 0.0,
-    hc_quantile: float = 0.70,
-    sigma_grid: str = "quantiles",
-    sigma_points: int = 9,
-    strong_tol: float = 1e-12,
-    early_stop: bool = True,
-) -> pd.DataFrame:
-    """End-to-end reproduction of the email-Eu experiment."""
-    data_dir_p = Path(data_dir)
-    outputs_dir_p = Path(outputs_dir)
-    (outputs_dir_p / "figures").mkdir(parents=True, exist_ok=True)
+    sigma_thwpr: float = 0.60,
+) -> dict[str, np.ndarray]:
+    n = F.n
+    u = np.full(n, 1.0/n, dtype=np.float64)
 
-    dataset_key = str(dataset).lower()
-    if dataset_key == "core":
-        url = SNAP_CORE_URL
-        filename = "email-Eu-core-temporal.txt.gz"
+    # PR: unweighted on high-confidence support
+    w_un = np.ones(F.m, dtype=np.float64)
+    P_pr, dang_pr = build_rowstochastic_csr_from_edges(n, F.src, F.dst, w_un)
+    pr = pagerank_rowstochastic_csr(P_pr, dang_pr, alpha=alpha, u=u)
+
+    # WPR: weighted by lambda on high-confidence
+    P_wpr, dang_wpr = build_rowstochastic_csr_from_edges(n, F.src, F.dst, F.w)
+    wpr = pagerank_rowstochastic_csr(P_wpr, dang_wpr, alpha=alpha, u=u)
+
+    # thWPR: threshold at sigma_thwpr on top of high-confidence cutoff
+    mask = (F.w >= sigma_thwpr)
+    src_t = F.src[mask]; dst_t = F.dst[mask]; w_t = F.w[mask]
+    if len(w_t) == 0:
+        thwpr = np.full(n, 1.0/n, dtype=np.float64)
     else:
-        if dataset_key not in SNAP_DEPT_URLS:
-            raise ValueError("dataset must be 'core' or one of dept1..dept4")
-        url = SNAP_DEPT_URLS[dataset_key]
-        filename = f"email-Eu-core-temporal-{dataset_key.upper()}.txt.gz"
+        P_th, dang_th = build_rowstochastic_csr_from_edges(n, src_t, dst_t, w_t)
+        thwpr = pagerank_rowstochastic_csr(P_th, dang_th, alpha=alpha, u=u)
 
-    gz_path = data_dir_p / filename
-    _download_if_missing(url, gz_path)
-    events = load_snap_email_events(gz_path)
+    # InStrength: training-window incoming counts (no propagation)
+    instr = F.instrength.copy()
 
-    tau, tau_prime = pick_time_cutoffs(events, float(train_frac), float(eval_frac))
-    train_events = events[events["time"] <= tau].copy()
-    test_events = events[(events["time"] > tau) & (events["time"] <= tau_prime)].copy()
+    return {
+        "PR": pr,
+        "WPR": wpr,
+        f"thWPR_sigma={sigma_thwpr:.2f}": thwpr,
+        "InStrength": instr,
+    }
 
-    edges_train = aggregate_email_edges(
-        train_events,
-        end_time=tau,
-        method=agg_method,
-        half_life_days=half_life_days,
-        scale=scale_method,
+
+# In[15]:
+
+
+# Cell 15 — Targets (paper + new ones): future volume, distinct senders, new incoming contacts, reply likelihood
+
+def target_future_incoming_volume(
+    df_eval: pd.DataFrame,
+    F: FuzzyDigraph,
+) -> np.ndarray:
+    """
+    Future incoming volume in eval window: sum_u (#events u->v in eval)
+    """
+    n = F.n
+    tgt = np.zeros(n, dtype=np.float64)
+    # restrict to node set
+    mask = df_eval["dst"].isin(F.id_to_idx)
+    tmp = df_eval[mask]
+    counts = tmp.groupby("dst").size()
+    for v_id, c in counts.items():
+        tgt[F.id_to_idx[int(v_id)]] = float(c)
+    return tgt
+
+def target_future_distinct_senders(
+    df_eval: pd.DataFrame,
+    F: FuzzyDigraph,
+) -> np.ndarray:
+    """
+    Diversity target: number of distinct senders in eval window for each recipient v.
+    """
+    n = F.n
+    tgt = np.zeros(n, dtype=np.float64)
+    tmp = df_eval[df_eval["dst"].isin(F.id_to_idx) & df_eval["src"].isin(F.id_to_idx)]
+    # unique src per dst
+    distinct = tmp.groupby("dst")["src"].nunique()
+    for v_id, c in distinct.items():
+        tgt[F.id_to_idx[int(v_id)]] = float(c)
+    return tgt
+
+def target_future_new_incoming_contacts(
+    df_train: pd.DataFrame,
+    df_eval: pd.DataFrame,
+    F: FuzzyDigraph,
+) -> np.ndarray:
+    """
+    Novelty target: number of distinct eval senders u->v such that u->v did NOT occur in training.
+    Uses raw training events (not high-confidence threshold), as "contact history".
+    """
+    n = F.n
+    tgt = np.zeros(n, dtype=np.float64)
+
+    train_pairs = set(
+        zip(df_train["src"].to_numpy(dtype=np.int64), df_train["dst"].to_numpy(dtype=np.int64))
     )
-    edges_base = edges_train[edges_train["w"] >= float(lambda_min)].copy()
 
-    nodes = np.union1d(edges_base["src"].unique(), edges_base["dst"].unique()).astype(np.int32)
-    nodes.sort()
+    tmp = df_eval[df_eval["dst"].isin(F.id_to_idx) & df_eval["src"].isin(F.id_to_idx)]
+    # distinct incoming senders in eval
+    pairs_eval = tmp.groupby(["src", "dst"]).size().reset_index()[["src","dst"]]
 
-    # high-confidence edges by quantile cutoff of base weights
-    w_base = edges_base["w"].to_numpy(dtype=np.float64)
-    wmin = float(np.quantile(w_base, float(hc_quantile))) if w_base.size else 1.0
-    edges_hc = edges_base[edges_base["w"] >= wmin].copy()
+    new_counts = defaultdict(int)
+    for u, v in pairs_eval.to_numpy(dtype=np.int64):
+        if (int(u), int(v)) not in train_pairs:
+            new_counts[int(v)] += 1
 
-    G_base = build_indexed_digraph(edges_base, nodes)
-    G_hc = build_indexed_digraph(edges_hc, nodes)
+    for v_id, c in new_counts.items():
+        tgt[F.id_to_idx[int(v_id)]] = float(c)
 
-    # Baselines
-    PR_adj, PR_rowsum = make_support_graph(G_base)
-    p_pr = pagerank_power(PR_adj, PR_rowsum, alpha=alpha, tol=tol, max_iter=max_iter)
-    p_wpr = pagerank_power(G_base.out_adj, G_base.out_wsum, alpha=alpha, tol=tol, max_iter=max_iter)
-    p_thwpr = pagerank_power(G_hc.out_adj, G_hc.out_wsum, alpha=alpha, tol=tol, max_iter=max_iter)
+    return tgt
 
-    # mu from HC edges
-    mu = compute_mu_from_edges(edges_hc, nodes)
+def target_future_reply_likelihood(
+    df_all: pd.DataFrame,
+    df_eval: pd.DataFrame,
+    F: FuzzyDigraph,
+    reply_horizon_days: float = 7.0,
+    use_replies_after_eval_end: bool = True,
+) -> np.ndarray:
+    """
+    Approximate reply likelihood from directionality and time.
 
-    # strong edges on HC graph
-    strong_edges = compute_strong_edges(G_hc.out_adj, tol=strong_tol, early_stop=early_stop)
+    For each pair (u->v) in eval, define t_in = first time u emailed v in eval window.
+    v is considered to have "replied to u" if there exists an event v->u at time t_out
+    with t_in < t_out <= t_in + H, where H = reply_horizon_days.
 
-    # evaluation target: future incoming volume
-    y = future_incoming_volume(test_events, nodes)
+    reply_likelihood(v) = (#distinct incoming senders u in eval that v replied to) / (#distinct incoming senders u in eval).
+    If denominator is 0, target is 0.
 
-    # sigma grid
-    hc_w = edges_hc["w"].to_numpy(dtype=np.float64)
-    sigmas = choose_sigma_grid(hc_w, mode=sigma_grid, points=sigma_points)
+    If use_replies_after_eval_end=True, we search replies in df_all (full timeline),
+    otherwise we restrict reply search to df_eval only.
+    """
+    H = int(reply_horizon_days * 24 * 3600)
 
-    # run SPPR per sigma
-    sppr_runs: List[Tuple[np.ndarray, Dict]] = []
-    for s in sigmas:
-        scores, meta = sppr_vertex_scores(
-            G_hc,
-            mu=mu,
-            strong_edges=strong_edges,
-            sigma=float(s),
-            alpha=alpha,
-            tol=tol,
-            max_iter=max_iter,
-        )
-        sppr_runs.append((scores, meta))
+    # incoming pairs in eval: earliest incoming time per (u,v)
+    tmp = df_eval[df_eval["dst"].isin(F.id_to_idx) & df_eval["src"].isin(F.id_to_idx)]
+    first_in = tmp.groupby(["src","dst"])["t"].min().reset_index()  # columns: src=u, dst=v, t=t_in
 
-    # collect results table
-    rows: List[Dict] = []
-    def add_row(name: str, scores: np.ndarray) -> None:
-        rows.append({
-            "method": name,
-            "rho": spearman_corr(scores, y),
-            "overlap@10": overlap_at_k(scores, y, 10),
-            "overlap@50": overlap_at_k(scores, y, 50),
-            "overlap@100": overlap_at_k(scores, y, 100),
-        })
+    # build outgoing time lists for candidate replies: (src=v, dst=u) -> sorted times
+    if use_replies_after_eval_end:
+        df_reply = df_all[df_all["src"].isin(F.id_to_idx) & df_all["dst"].isin(F.id_to_idx)]
+    else:
+        df_reply = tmp
 
-    add_row("PR", p_pr)
-    add_row("WPR", p_wpr)
-    add_row("thWPR", p_thwpr)
-    for scores, meta in sppr_runs:
-        add_row(f"SPPR({meta['sigma']:.4f},{meta['m_classes']})", scores)
+    out_times = defaultdict(list)
+    for s, d, t in df_reply[["src","dst","t"]].to_numpy(dtype=np.int64):
+        out_times[(int(s), int(d))].append(int(t))
+    for k in out_times:
+        out_times[k].sort()
 
-    results = pd.DataFrame(rows)
+    denom = np.zeros(F.n, dtype=np.float64)
+    numer = np.zeros(F.n, dtype=np.float64)
 
-    # export CSV
-    results.to_csv(outputs_dir_p / "ranking_results.csv", index=False)
+    # for each incoming dyad u->v with earliest time t_in, check if v->u occurs soon after
+    for u_id, v_id, t_in in first_in.to_numpy(dtype=np.int64):
+        u_id = int(u_id); v_id = int(v_id); t_in = int(t_in)
+        v_idx = F.id_to_idx[v_id]
+        denom[v_idx] += 1.0
 
-    # export sigma curve
-    sig_list = [float(meta["sigma"]) for _, meta in sppr_runs]
-    m_list = [int(meta["m_classes"]) for _, meta in sppr_runs]
-    rho_list = [spearman_corr(scores, y) for scores, _ in sppr_runs]
-    curve = pd.DataFrame({"sigma": sig_list, "m_classes": m_list, "spearman": rho_list})
-    curve.to_csv(outputs_dir_p / "sigma_multiscale_curve.csv", index=False)
+        times = out_times.get((v_id, u_id), None)
+        if not times:
+            continue
+        j = bisect_right(times, t_in)
+        if j < len(times) and times[j] <= t_in + H:
+            numer[v_idx] += 1.0
 
-    return results
+    # likelihood in [0,1]
+    tgt = np.zeros(F.n, dtype=np.float64)
+    mask = denom > 0
+    tgt[mask] = numer[mask] / denom[mask]
+    return tgt
+
+
+# In[16]:
+
+
+# Cell 16 — evaluation wrapper for a set of methods against a target
+def evaluate_methods(
+    method_scores: dict[str, np.ndarray],
+    target: np.ndarray,
+    node_ids: np.ndarray,
+    ks: tuple[int, ...] = (10, 50, 100),
+    mask: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """
+    mask: optional boolean mask of nodes to include in evaluation (stress tests).
+    """
+    if mask is None:
+        mask = np.ones_like(target, dtype=bool)
+
+    out = []
+    for name, score in method_scores.items():
+        s = score[mask]
+        t = target[mask]
+        ids = node_ids[mask]
+        row = {"method": name, "rho": spearman_rho(s, t)}
+        for k in ks:
+            row[f"overlap@{k}"] = overlap_at_k(s, t, ids, k)
+        out.append(row)
+
+    return pd.DataFrame(out).set_index("method")
+
+
+# In[17]:
+
+
+# Cell 17 — full pipeline for one split: builds graph, computes baselines + SPPR (at chosen sigmas), evaluates (paper target)
+
+def run_split_pipeline(
+    df_all: pd.DataFrame,
+    q_train: float,
+    q_eval: float,
+    sigma_table: list[float] = SIGMA_TABLE,
+    alpha: float = ALPHA,
+    sigma_thwpr: float = SIGMA_THWPR,
+    highconf_quantile: float = 0.70,
+    eps: float = STRONG_EPS,
+) -> dict:
+    """
+    Returns dict with:
+      F, adj, strong_edges_idx,
+      baselines_scores,
+      sppr_scores_table (dict sigma->scores),
+      eval_targets (dict name->target),
+      results_paper_target_table (DataFrame like Table)
+    """
+    tau, tau2 = time_quantiles(df_all, q_train=q_train, q_eval=q_eval)
+    df_train, df_eval = split_events(df_all, q_train=q_train, q_eval=q_eval)
+
+    F, edges_full = build_fuzzy_graph_from_train(
+        df_train=df_train,
+        q_train=q_train,
+        q_eval=q_eval,
+        tau=tau,
+        tau2=tau2,
+        highconf_quantile=highconf_quantile
+    )
+
+    adj = make_adjlists(F)
+
+    # cache key: depends on split and cutoff
+    cache_key = f"q{int(q_train*100)}_{int(q_eval*100)}_lammin{F.lambda_min:.6f}_n{F.n}_m{F.m}"
+    strong_idx = compute_strong_edges(F, adj, eps=eps, cache_key=cache_key)
+
+    base = baseline_scores(F, alpha=alpha, sigma_thwpr=sigma_thwpr)
+
+    # SPPR for the table sigmas
+    sppr = {}
+    m_by_sigma = {}
+    for s in sigma_table:
+        scores, m = sppr_scores_for_sigma(F, adj, strong_idx, sigma=float(s), alpha=alpha)
+        sppr[f"SPPR({s:.4f},{m})"] = scores
+        m_by_sigma[float(s)] = int(m)
+
+    # Paper target: future incoming volume (counts)
+    tgt_vol = target_future_incoming_volume(df_eval, F)
+
+    # Evaluate baselines
+    methods_for_table = dict(base)
+    # Evaluate SPPR rows for table
+    methods_for_table.update(sppr)
+
+    res = evaluate_methods(methods_for_table, tgt_vol, node_ids=F.idx_to_id)
+
+    # Return everything + raw split frames for computing additional targets
+    return dict(
+        q_train=q_train, q_eval=q_eval, tau=tau, tau2=tau2,
+        df_train=df_train, df_eval=df_eval,
+        F=F, adj=adj, strong_idx=strong_idx,
+        edges_full_train=edges_full,
+        baselines=base,
+        sppr_table=sppr,
+        m_by_sigma=m_by_sigma,
+        target_volume=tgt_vol,
+        results_table=res
+    )
+
+
+# In[18]:
+
+
+# Cell 18 — run the two splits used in the paper
+run_80_90 = run_split_pipeline(df, q_train=0.80, q_eval=0.90)
+run_70_80 = run_split_pipeline(df, q_train=0.70, q_eval=0.80)
+
+# sanity prints matching the manuscript
+for run in (run_80_90, run_70_80):
+    F = run["F"]
+    print(f"\nSplit q_train={run['q_train']:.2f}, q_eval={run['q_eval']:.2f}")
+    print(f"tau={run['tau']}, tau'={run['tau2']}")
+    print(f"Train events: {len(run['df_train']):,}, Eval events: {len(run['df_eval']):,}")
+    print(f"Training nodes n={F.n}, training dyads (all)={len(run['edges_full_train']):,}")
+    print(f"High-conf lambda_min={F.lambda_min:.6f}, high-conf edges={F.m:,}")
+    print(f"Strong edges (cached)={len(run['strong_idx']):,}")
+
+
+# In[19]:
+
+
+# Cell 23 — sigma sweep utilities for figures (m(sigma), rho(sigma), overlap@100(sigma))
+
+def sigma_grid_quantiles(weights: np.ndarray, q_low: float, q_high: float, num: int) -> np.ndarray:
+    qs = np.linspace(q_low, q_high, num)
+    return np.unique(np.quantile(weights, qs))
+
+def sppr_sweep(
+    run: dict,
+    sigmas: np.ndarray,
+    target: np.ndarray,
+    alpha: float = ALPHA,
+) -> pd.DataFrame:
+    F = run["F"]
+    adj = run["adj"]
+    strong_idx = run["strong_idx"]
+    node_ids = F.idx_to_id
+
+    rows = []
+    for s in tqdm(sigmas, desc="SPPR sweep"):
+        scores, m = sppr_scores_for_sigma(F, adj, strong_idx, sigma=float(s), alpha=alpha)
+        rho = spearman_rho(scores, target)
+        ov100 = overlap_at_k(scores, target, node_ids, 100)
+        rows.append({"sigma": float(s), "m": int(m), "rho": rho, "overlap@100": ov100})
+    return pd.DataFrame(rows).sort_values("sigma").reset_index(drop=True)
+
+
+# In[20]:
+
+
+# Cell 27 — helpers for consistent ordering + LaTeX export
+
+def ordered_results(res_df: pd.DataFrame, run: dict) -> pd.DataFrame:
+    """
+    Orders rows as: baselines first, then SPPR rows in the exact order they were created for that run.
+    Safe even if some rows are missing.
+    """
+    order = list(run["baselines"].keys()) + list(run["sppr_table"].keys())
+    order = [k for k in order if k in res_df.index]
+    return res_df.loc[order]
+
+def format_results_for_paper(df_res: pd.DataFrame) -> pd.DataFrame:
+    """
+    Paper-style formatting:
+      - rho: 4 decimals
+      - overlaps: 2 decimals
+    Returns a copy with rounded floats (still numeric).
+    """
+    out = df_res.copy()
+    if "rho" in out.columns:
+        out["rho"] = out["rho"].astype(float).round(4)
+    for c in out.columns:
+        if c.startswith("overlap@"):
+            out[c] = out[c].astype(float).round(2)
+    return out
+
+def results_to_latex(df_res: pd.DataFrame) -> str:
+    """
+    LaTeX export with column-specific formatting (rho=4dp, overlaps=2dp).
+    """
+    df_fmt = format_results_for_paper(df_res)
+
+    def _fmt(x, col):
+        if pd.isna(x):
+            return ""
+        if col == "rho":
+            return f"{float(x):.4f}"
+        if str(col).startswith("overlap@"):
+            return f"{float(x):.2f}"
+        return f"{float(x):.4f}"
+
+    # Build formatters dict
+    fmts = {col: (lambda x, col=col: _fmt(x, col)) for col in df_fmt.columns}
+    return df_fmt.to_latex(formatters=fmts)
+
+
+# In[21]:
+
+
+# Cell 31 — Reply likelihood target (0.80/0.90 split)
+
+F = run_80_90["F"]
+df_eval = run_80_90["df_eval"]
+
+tgt_reply_7d_80_90 = target_future_reply_likelihood(
+    df_all=df,              # full timeline to find replies after incoming
+    df_eval=df_eval,        # incoming events in the evaluation window
+    F=F,
+    reply_horizon_days=7.0,
+    use_replies_after_eval_end=True
+)
+
+methods = {}
+methods.update(run_80_90["baselines"])
+methods.update(run_80_90["sppr_table"])
+
+res_reply_80_90 = evaluate_methods(methods, tgt_reply_7d_80_90, node_ids=F.idx_to_id)
+ordered_results(res_reply_80_90, run_80_90)
+
+
+# In[22]:
+
+
+# Cell 32 — LaTeX for reply likelihood (0.80/0.90 split)
+
+tab_reply_80_90 = ordered_results(res_reply_80_90, run_80_90)
+print(results_to_latex(tab_reply_80_90))
+
+
+# In[23]:
+
+
+# Cell — Reply likelihood target + table (0.70/0.80 split)
+
+F = run_70_80["F"]
+df_eval = run_70_80["df_eval"]
+
+tgt_reply_7d_70_80 = target_future_reply_likelihood(
+    df_all=df,              # full timeline to find replies after incoming
+    df_eval=df_eval,        # incoming events in the evaluation window
+    F=F,
+    reply_horizon_days=7.0,
+    use_replies_after_eval_end=True
+)
+
+methods = {}
+methods.update(run_70_80["baselines"])     # includes PR, WPR, thWPR_sigma=..., InStrength
+methods.update(run_70_80["sppr_table"])    # SPPR rows for SIGMA_TABLE
+
+res_reply_70_80 = evaluate_methods(methods, tgt_reply_7d_70_80, node_ids=F.idx_to_id)
+
+tab_reply_70_80 = ordered_results(res_reply_70_80, run_70_80)
+display(tab_reply_70_80)
+
+print(results_to_latex(tab_reply_70_80))
+
+
+# In[ ]:
+
+
+
+
