@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
+# In[24]:
 
 
 # # Cell 1 
 # %pip install tqdm
 
 
-# In[2]:
+# In[25]:
 
 
 # Cell 2 — imports, global config, paths
@@ -60,7 +60,7 @@ STRONG_EPS = 1e-12
 SIGMA_TABLE = [0.2626, 0.4415, 0.4989, 0.5550, 0.5825, 0.7215, 0.9900]
 
 
-# In[3]:
+# In[26]:
 
 
 # Cell 3 — download SNAP data (runs only if missing)
@@ -74,7 +74,7 @@ else:
     print(f"Found: {RAW_GZ}")
 
 
-# In[4]:
+# In[27]:
 
 
 # Cell 4 — unzip to a .txt for faster reloading (runs only if missing)
@@ -89,7 +89,7 @@ else:
     print(f"Found: {RAW_TXT}")
 
 
-# In[5]:
+# In[28]:
 
 
 # Cell 5 — load events into a DataFrame
@@ -99,7 +99,7 @@ df = df.sort_values("t").reset_index(drop=True)
 df.head(), df.shape
 
 
-# In[6]:
+# In[29]:
 
 
 # Cell 6 — utilities: splitting, stable ranking, overlap, etc.
@@ -143,7 +143,7 @@ def spearman_rho(score: np.ndarray, target: np.ndarray) -> float:
     return float(rho)
 
 
-# In[7]:
+# In[30]:
 
 
 # Cell 7 — build dyadic counts and fuzzy memberships (lambda), then high-confidence cutoff + mu
@@ -252,7 +252,7 @@ def build_fuzzy_graph_from_train(
     return F, grp
 
 
-# In[8]:
+# In[31]:
 
 
 # Cell 8 — build adjacency lists (needed for widest-path and SCC thresholding)
@@ -303,7 +303,7 @@ def make_adjlists(F: FuzzyDigraph) -> AdjLists:
                     in_nbrs=in_nbrs, in_wts=in_wts)
 
 
-# In[9]:
+# In[32]:
 
 
 # Cell 9 — PageRank on a row-stochastic kernel represented as a sparse CSR (with dangling fix)
@@ -350,7 +350,7 @@ def pagerank_rowstochastic_csr(
     return p
 
 
-# In[10]:
+# In[33]:
 
 
 # Cell 10 — build CSR row-stochastic matrix from edges (node-level baselines)
@@ -381,7 +381,7 @@ def build_rowstochastic_csr_from_edges(
     return P, dangling
 
 
-# In[11]:
+# In[34]:
 
 
 # Cell 11 — widest-path (max–min) routine + strong-edge extraction (streaming per source)
@@ -450,7 +450,7 @@ def compute_strong_edges(
     return strong_idx
 
 
-# In[12]:
+# In[35]:
 
 
 # Cell 12 — SCC partition of the sigma-cut digraph (custom Kosaraju; uses threshold sigma on weights)
@@ -512,7 +512,7 @@ def scc_kosaraju_sigma(adj: AdjLists, sigma: float) -> tuple[np.ndarray, int]:
     return comp, comp_count
 
 
-# In[13]:
+# In[36]:
 
 
 # Cell 13 — SPPR kernel build at a given sigma + lift to vertices
@@ -584,7 +584,7 @@ def sppr_scores_for_sigma(
     return scores, m
 
 
-# In[14]:
+# In[37]:
 
 
 # Cell 14 — Baseline scores: PR, WPR, thWPR, plus InStrength
@@ -626,7 +626,7 @@ def baseline_scores(
     }
 
 
-# In[15]:
+# In[38]:
 
 
 # Cell 15 — Targets (paper + new ones): future volume, distinct senders, new incoming contacts, reply likelihood
@@ -755,7 +755,7 @@ def target_future_reply_likelihood(
     return tgt
 
 
-# In[16]:
+# In[39]:
 
 
 # Cell 16 — evaluation wrapper for a set of methods against a target
@@ -763,7 +763,7 @@ def evaluate_methods(
     method_scores: dict[str, np.ndarray],
     target: np.ndarray,
     node_ids: np.ndarray,
-    ks: tuple[int, ...] = (10, 50, 100),
+    ks: tuple[int, ...] = (50, 100),
     mask: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """
@@ -785,7 +785,7 @@ def evaluate_methods(
     return pd.DataFrame(out).set_index("method")
 
 
-# In[17]:
+# In[40]:
 
 
 # Cell 17 — full pipeline for one split: builds graph, computes baselines + SPPR (at chosen sigmas), evaluates (paper target)
@@ -860,7 +860,7 @@ def run_split_pipeline(
     )
 
 
-# In[18]:
+# In[41]:
 
 
 # Cell 18 — run the two splits used in the paper
@@ -878,7 +878,7 @@ for run in (run_80_90, run_70_80):
     print(f"Strong edges (cached)={len(run['strong_idx']):,}")
 
 
-# In[19]:
+# In[42]:
 
 
 # Cell 23 — sigma sweep utilities for figures (m(sigma), rho(sigma), overlap@100(sigma))
@@ -907,7 +907,7 @@ def sppr_sweep(
     return pd.DataFrame(rows).sort_values("sigma").reset_index(drop=True)
 
 
-# In[20]:
+# In[43]:
 
 
 # Cell 27 — helpers for consistent ordering + LaTeX export
@@ -956,7 +956,7 @@ def results_to_latex(df_res: pd.DataFrame) -> str:
     return df_fmt.to_latex(formatters=fmts)
 
 
-# In[21]:
+# In[44]:
 
 
 # Cell 31 — Reply likelihood target (0.80/0.90 split)
@@ -976,11 +976,11 @@ methods = {}
 methods.update(run_80_90["baselines"])
 methods.update(run_80_90["sppr_table"])
 
-res_reply_80_90 = evaluate_methods(methods, tgt_reply_7d_80_90, node_ids=F.idx_to_id)
+res_reply_80_90 = evaluate_methods(methods, tgt_reply_7d_80_90, node_ids=F.idx_to_id, ks=(50, 100))
 ordered_results(res_reply_80_90, run_80_90)
 
 
-# In[22]:
+# In[45]:
 
 
 # Cell 32 — LaTeX for reply likelihood (0.80/0.90 split)
@@ -989,7 +989,7 @@ tab_reply_80_90 = ordered_results(res_reply_80_90, run_80_90)
 print(results_to_latex(tab_reply_80_90))
 
 
-# In[23]:
+# In[46]:
 
 
 # Cell — Reply likelihood target + table (0.70/0.80 split)
@@ -1009,7 +1009,7 @@ methods = {}
 methods.update(run_70_80["baselines"])     # includes PR, WPR, thWPR_sigma=..., InStrength
 methods.update(run_70_80["sppr_table"])    # SPPR rows for SIGMA_TABLE
 
-res_reply_70_80 = evaluate_methods(methods, tgt_reply_7d_70_80, node_ids=F.idx_to_id)
+res_reply_70_80 = evaluate_methods(methods, tgt_reply_7d_70_80, node_ids=F.idx_to_id, ks=(50, 100))
 
 tab_reply_70_80 = ordered_results(res_reply_70_80, run_70_80)
 display(tab_reply_70_80)
