@@ -17,7 +17,6 @@ This repository reproduces the experiments on the SNAP temporal email dataset
 - `scripts/run_email_eu.py` — end-to-end experiment runner (downloads data, runs baselines + SPPR, saves tables/figures).
 - `src/sppr_fuzzy/` — core routines (PageRank power iteration, widest-path connectivity, SCC quotienting, SPPR lift).
 - `paper/` — the LaTeX source of the manuscript 
-- `data/` — raw downloaded data 
 
 ## Quickstart
 
